@@ -21,11 +21,26 @@ const RECORDER = 'Practitioner/dr-iyer'
 
 const SEARCH_DEBOUNCE_MS = 250
 const SEARCH_COUNT = 12
+const AUDIT_POLL_MS = 4000
 
 const BADGES = {
   namaste: { label: 'NAMASTE', className: 'bg-teal-50 text-teal-700 ring-teal-600/20' },
   tm2: { label: 'ICD-11 TM2', className: 'bg-amber-50 text-amber-700 ring-amber-600/20' },
   biomed: { label: 'ICD-11 Bio', className: 'bg-blue-50 text-blue-700 ring-blue-600/20' },
+}
+
+// $expand ships the traditional term as designations. The diacritical form is the properly
+// rendered one ("sandhigatavātaḥ"); the roman form is an ASCII transliteration where capitals
+// encode long vowels ("sandhigatavAtaH"), so it is shown verbatim and never re-cased.
+const TRADITIONAL_USES = ['diacritical', 'roman']
+
+/** The traditional term for a NAMASTE expansion entry, or null when none was published. */
+function traditionalTerm(entry) {
+  for (const use of TRADITIONAL_USES) {
+    const match = (entry?.designation ?? []).find((item) => item.use?.code === use && item.value)
+    if (match) return match.value
+  }
+  return null
 }
 
 /** Which code system an expansion entry or a stored coding belongs to. */
@@ -46,7 +61,8 @@ async function fetchJson(path, options) {
   const response = await fetch(`${API_BASE}${path}`, options)
   const body = await response.json().catch(() => null)
   if (!response.ok) {
-    throw new Error(diagnosticsOf(body) ?? `${response.status} ${response.statusText}`)
+    // Consent refusals are plain {reason}; auth failures are OperationOutcome diagnostics.
+    throw new Error(body?.reason ?? diagnosticsOf(body) ?? `${response.status} ${response.statusText}`)
   }
   return body
 }
@@ -137,7 +153,54 @@ export default function App() {
   const [problemList, setProblemList] = useState(null)
   const [problemError, setProblemError] = useState(null)
 
+  // Mock ABHA session for the auth-gated POST /diagnosis; search/translate stay open without it.
+  const [token, setToken] = useState(null)
+  const [consent, setConsent] = useState('granted')
+  const [auditOk, setAuditOk] = useState(null)
+
   const searchRun = useRef(0)
+
+  useEffect(() => {
+    fetchJson('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ abha: ABHA }),
+    })
+      .then((body) => setToken(body.access_token))
+      .catch(() => setToken(null))
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function poll() {
+      try {
+        const body = await fetchJson('/audit/verify')
+        if (!cancelled) setAuditOk(body.ok === true)
+      } catch {
+        if (!cancelled) setAuditOk(null)
+      }
+    }
+    poll()
+    const timer = setInterval(poll, AUDIT_POLL_MS)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [])
+
+  async function toggleConsent() {
+    const next = consent === 'granted' ? 'revoked' : 'granted'
+    try {
+      const body = await fetchJson('/consent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ abha: ABHA, status: next }),
+      })
+      setConsent(body.status)
+    } catch (error) {
+      setSaveError(`Consent update failed: ${error.message}`)
+    }
+  }
 
   // Debounced autocomplete against $expand.
   useEffect(() => {
@@ -171,7 +234,7 @@ export default function App() {
   }, [query])
 
   async function selectNamaste(entry) {
-    setSelected({ code: entry.code, display: entry.display })
+    setSelected(entry) // kept whole so the card can read its designations
     setMatches(null)
     setTranslateError(null)
     setBiomedChoice(null)
@@ -216,7 +279,10 @@ export default function App() {
       }
       const result = await fetchJson('/diagnosis', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
         body: JSON.stringify(body),
       })
       setSaved(result)
@@ -260,6 +326,42 @@ export default function App() {
             Demo: the ABHA number, the consent step and the practitioner identity are simulated. No real ABDM
             authentication or consent artefact is involved.
           </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+            <span className="font-semibold tracking-wide text-slate-500 uppercase">Compliance</span>
+            <span
+              className={`inline-flex items-center rounded-full px-2.5 py-1 font-medium ring-1 ring-inset ${
+                token
+                  ? 'bg-emerald-50 text-emerald-800 ring-emerald-600/20'
+                  : 'bg-slate-100 text-slate-500 ring-slate-300'
+              }`}
+            >
+              ABHA session: {token ? 'mock' : '…'}
+            </span>
+            <button
+              type="button"
+              onClick={toggleConsent}
+              className={`inline-flex items-center rounded-full px-2.5 py-1 font-medium ring-1 ring-inset ${
+                consent === 'granted'
+                  ? 'bg-emerald-50 text-emerald-800 ring-emerald-600/20'
+                  : 'bg-rose-50 text-rose-800 ring-rose-600/20'
+              }`}
+              title="POST /consent — simulated in-memory gate"
+            >
+              Consent: {consent}
+            </button>
+            <span
+              className={`inline-flex items-center rounded-full px-2.5 py-1 font-medium ring-1 ring-inset ${
+                auditOk === true
+                  ? 'bg-emerald-50 text-emerald-800 ring-emerald-600/20'
+                  : auditOk === false
+                    ? 'bg-rose-50 text-rose-800 ring-rose-600/20'
+                    : 'bg-slate-100 text-slate-500 ring-slate-300'
+              }`}
+            >
+              Audit chain:{' '}
+              {auditOk === true ? 'intact ✓' : auditOk === false ? 'BROKEN ✗' : '…'}
+            </span>
+          </div>
         </div>
       </header>
 
@@ -301,6 +403,7 @@ export default function App() {
                 const isNamaste = source === 'namaste'
                 const isBiomed = source === 'biomed'
                 const clickable = isNamaste || isBiomed
+                const traditional = isNamaste ? traditionalTerm(entry) : null
                 return (
                   <li key={`${entry.system}-${entry.code}-${index}`}>
                     <button
@@ -326,7 +429,14 @@ export default function App() {
                     >
                       <Badge source={source} />
                       <code className="font-mono text-sm font-semibold text-slate-800">{entry.code}</code>
-                      <span className="text-sm text-slate-600">{entry.display ?? '(no display)'}</span>
+                      {traditional ? (
+                        <span className="min-w-0">
+                          <span className="block text-sm font-medium text-slate-800">{traditional}</span>
+                          {entry.display && <span className="block text-xs text-slate-500">{entry.display}</span>}
+                        </span>
+                      ) : (
+                        <span className="text-sm text-slate-600">{entry.display ?? '(no display)'}</span>
+                      )}
                     </button>
                   </li>
                 )
@@ -347,7 +457,12 @@ export default function App() {
                   <span className="text-xs text-slate-500">selected by clinician</span>
                 </div>
                 <p className="mt-2 font-mono text-sm font-semibold">{selected.code}</p>
-                <p className="text-sm text-slate-700">{selected.display ?? '(no display)'}</p>
+                <p className="text-sm font-medium text-slate-800">
+                  {traditionalTerm(selected) ?? selected.display ?? '(no display)'}
+                </p>
+                {traditionalTerm(selected) && selected.display && (
+                  <p className="text-xs text-slate-500">{selected.display}</p>
+                )}
               </article>
 
               <article className="rounded-lg border border-amber-200 bg-amber-50/40 p-4">
@@ -474,7 +589,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={recordDiagnosis}
-                disabled={saving || !tm2}
+                disabled={saving || !tm2 || !token}
                 className="rounded-lg bg-teal-700 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-slate-300"
               >
                 {saving ? 'Recording…' : 'Record diagnosis'}

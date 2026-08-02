@@ -37,7 +37,7 @@ VITE_API_BASE=http://localhost:8000 npm run dev
 
 | Step | Backend call | Notes |
 | --- | --- | --- |
-| Autocomplete | `GET /ValueSet/$expand?filter=&count=12` | 250 ms debounce. Rows badged NAMASTE (teal), ICD-11 TM2 (amber), ICD-11 Bio (blue) from the expansion-source extension. |
+| Autocomplete | `GET /ValueSet/$expand?filter=&count=12` | 250 ms debounce. Rows badged NAMASTE (teal), ICD-11 TM2 (amber), ICD-11 Bio (blue) from the expansion-source extension. NAMASTE rows lead with the traditional term from the entry's `designation` array, with the English gloss underneath. |
 | Select a NAMASTE row | `GET /ConceptMap/$translate?code=` | Curated TM2 target plus live WHO biomedicine candidates with confidence. |
 | Record diagnosis | `POST /diagnosis` | Sends the chosen biomedicine code, or none to record it as pending. |
 | Problem list | `GET /Patient/{id}/problem-list` | Loaded after a successful save. |
