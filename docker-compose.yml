@@ -1,0 +1,81 @@
+# WARNING: the whoicd/icd-api image is large and bundles the full ICD-11 release.
+# The first `docker compose pull` will take several minutes, and the who-icd container
+# needs internet access on its first start while it loads the classification, so it can
+# take several more minutes before it actually answers requests.
+#
+# Service names below are the internal DNS names on the terminology network and must stay
+# in sync with docs/CONTEXT.md, which is the source of truth for ports and endpoints.
+
+name: namaste-icd11
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: namaste
+      POSTGRES_PASSWORD: namaste
+      POSTGRES_DB: terminology
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U namaste -d terminology"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - terminology
+    restart: unless-stopped
+
+  who-icd:
+    image: whoicd/icd-api
+    environment:
+      - acceptLicense=true
+    ports:
+      - "8081:80"
+    # No healthcheck: the image ships neither curl nor wget, so any HTTP-based check would
+    # report unhealthy forever and block every service that waits on it.
+    networks:
+      - terminology
+    restart: unless-stopped
+
+  hapi-fhir:
+    image: hapiproject/hapi:latest
+    ports:
+      - "8080:8080"
+    networks:
+      - terminology
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://namaste:namaste@db:5432/terminology
+      WHO_BASE: http://who-icd:80
+      HAPI_BASE: http://hapi-fhir:8080/fhir
+      ICD_RELEASE_ID: 2026-01
+    # who-icd and hapi-fhir stay unready for a long time after "started" -- who-icd loads the
+    # ICD-11 release and hapi-fhir runs its schema migrations -- so service_started says nothing
+    # about whether they answer requests. The api's HTTP clients must retry with backoff; that
+    # belongs in the api code, not here.
+    depends_on:
+      db:
+        condition: service_healthy
+      who-icd:
+        condition: service_started
+      hapi-fhir:
+        condition: service_started
+    networks:
+      - terminology
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+
+networks:
+  terminology:
+    driver: bridge
