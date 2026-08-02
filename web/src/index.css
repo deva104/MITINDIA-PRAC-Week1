@@ -1,0 +1,6 @@
+@import 'tailwindcss';
+
+/* Devanagari and IAST diacritics must render, so keep a font stack that covers them. */
+html {
+  font-family: 'Segoe UI', 'Nirmala UI', system-ui, -apple-system, sans-serif;
+}
