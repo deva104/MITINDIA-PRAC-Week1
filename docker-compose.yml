@@ -53,6 +53,10 @@ services:
     build: ./api
     ports:
       - "8000:8000"
+    # Terminology source data and derived CSVs live on the host, not in the image, so the
+    # ingestion scripts can read the NAMASTE export and write alongside it.
+    volumes:
+      - ./data:/data
     environment:
       DATABASE_URL: postgresql+psycopg://namaste:namaste@db:5432/terminology
       WHO_BASE: http://who-icd:80

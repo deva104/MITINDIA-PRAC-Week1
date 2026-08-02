@@ -4,3 +4,8 @@ httpx==0.28.1
 pydantic==2.13.4
 sqlalchemy==2.0.51
 psycopg[binary]==3.3.4
+
+# Terminology ingestion / recon scripts. xlrd reads the legacy .xls NAMASTE export;
+# xlrd 2.x is .xls-only by design, so .xlsx exports would need openpyxl instead.
+pandas==3.0.5
+xlrd==2.0.2

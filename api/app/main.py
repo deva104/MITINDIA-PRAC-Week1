@@ -3,6 +3,10 @@
 /spike returns one hard-coded dual-coded diagnosis, except for the ICD-11 biomedicine
 display, which is fetched live from the WHO container to prove the wiring works.
 Facts (system URIs, endpoints, anchor code) come from docs/CONTEXT.md.
+
+The WHO container is a data source reached through its native API only; its /fhir endpoints
+are disabled, pre-release, R5, and pinned to a different release. This service is the FHIR
+R4 layer.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator
 from urllib.parse import urlsplit
 
 import httpx
@@ -34,11 +38,16 @@ ICD_RELEASE_ID = os.getenv("ICD_RELEASE_ID", "")
 
 TIMEOUT = httpx.Timeout(10.0, connect=3.0)
 
-LookupPath = Literal["fhir", "native"]
+# Required by the WHO native API; without API-Version it answers with a different shape.
+NATIVE_HEADERS = {
+    "API-Version": "v2",
+    "Accept": "application/json",
+    "Accept-Language": "en",
+}
 
 
 class WhoLookupError(RuntimeError):
-    """Neither the FHIR nor the native WHO lookup could resolve a display."""
+    """The WHO native lookup could not resolve a display for a code."""
 
 
 @asynccontextmanager
@@ -64,18 +73,6 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _display_from_parameters(payload: Any) -> str | None:
-    """Pull the `display` value out of a FHIR Parameters resource."""
-    if not isinstance(payload, dict):
-        return None
-    for parameter in payload.get("parameter") or []:
-        if isinstance(parameter, dict) and parameter.get("name") == "display":
-            value = parameter.get("valueString")
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
 def _label(value: Any) -> str | None:
     """Read an ICD-11 label, which is either a plain string or {"@value": "..."}."""
     if isinstance(value, str) and value.strip():
@@ -87,96 +84,64 @@ def _label(value: Any) -> str | None:
     return None
 
 
-def _local_url(absolute_uri: str) -> str:
+def local_entity_url(absolute_uri: str) -> str:
     """Re-point an id.who.int URI at our own container.
 
-    Native responses carry absolute `stemId` URIs on id.who.int. Following one verbatim would
-    leave the local container and hit the public API, so keep only the path.
+    Native responses carry absolute URIs on id.who.int. Following one verbatim would leave the
+    local container and hit the public API, so keep only the path.
     """
     return f"{WHO_BASE}{urlsplit(absolute_uri).path}"
 
 
-async def _lookup_via_fhir(client: httpx.AsyncClient, code: str) -> str | None:
-    response = await client.get(
-        f"{WHO_BASE}/fhir/CodeSystem/$lookup",
-        params={"system": ICD11_MMS_SYSTEM, "code": code},
-        headers={"Accept": "application/fhir+json, application/json"},
-    )
-    if response.status_code != 200:
-        logger.warning("WHO FHIR $lookup for %s returned HTTP %s", code, response.status_code)
-        return None
-    return _display_from_parameters(response.json())
+def codeinfo_url(code: str) -> str:
+    return f"{WHO_BASE}/icd/release/11/{ICD_RELEASE_ID}/mms/codeinfo/{code}"
 
 
-async def _lookup_via_native(client: httpx.AsyncClient, code: str) -> str | None:
-    if not ICD_RELEASE_ID:
-        logger.error("ICD_RELEASE_ID is unset, cannot use the native WHO endpoint")
-        return None
+async def who_lookup(client: httpx.AsyncClient, code: str) -> str:
+    """Resolve an ICD-11 MMS code to its title using the WHO native API.
 
-    headers = {"API-Version": "v2", "Accept": "application/json", "Accept-Language": "en"}
-    response = await client.get(
-        f"{WHO_BASE}/icd/release/11/{ICD_RELEASE_ID}/mms/codeinfo/{code}",
-        headers=headers,
-    )
-    if response.status_code != 200:
-        logger.warning("WHO codeinfo for %s returned HTTP %s", code, response.status_code)
-        return None
-
-    payload = response.json()
-    if not isinstance(payload, dict):
-        return None
-
-    title = _label(payload.get("title"))
-    if title:
-        return title
-
-    # codeinfo often answers with only a stemId pointing at the entity that owns the title,
-    # so spend one more request to resolve it.
-    stem_id = payload.get("stemId")
-    if not isinstance(stem_id, str) or not stem_id:
-        return None
-
-    entity = await client.get(_local_url(stem_id), headers=headers)
-    if entity.status_code != 200:
-        logger.warning("WHO entity %s returned HTTP %s", stem_id, entity.status_code)
-        return None
-    body = entity.json()
-    return _label(body.get("title")) if isinstance(body, dict) else None
-
-
-async def who_lookup(client: httpx.AsyncClient, code: str) -> tuple[str, LookupPath]:
-    """Resolve an ICD-11 MMS display, preferring the FHIR endpoint over the native one.
-
-    Returns the display and which path produced it. Raises WhoLookupError if both fail.
+    Two hops, because codeinfo carries no title: codeinfo -> follow `stemId` -> read `title`.
+    Raises WhoLookupError on any failure.
     """
     if not WHO_BASE:
         raise WhoLookupError("WHO_BASE is not set")
+    if not ICD_RELEASE_ID:
+        raise WhoLookupError("ICD_RELEASE_ID is not set")
 
-    failures: list[str] = []
+    try:
+        info = await client.get(codeinfo_url(code), headers=NATIVE_HEADERS)
+        if info.status_code != 200:
+            raise WhoLookupError(f"codeinfo for {code} returned HTTP {info.status_code}")
 
-    for path, attempt in (("fhir", _lookup_via_fhir), ("native", _lookup_via_native)):
-        try:
-            display = await attempt(client, code)
-        except httpx.TimeoutException:
-            logger.warning("WHO %s lookup for %s timed out", path, code)
-            failures.append(f"{path}: timeout")
-            continue
-        except httpx.RequestError as exc:
-            # Expected while the WHO container is still loading the ICD-11 release.
-            logger.warning("WHO %s lookup for %s failed to connect: %s", path, code, exc)
-            failures.append(f"{path}: {type(exc).__name__}")
-            continue
-        except ValueError:
-            logger.warning("WHO %s lookup for %s returned malformed JSON", path, code)
-            failures.append(f"{path}: invalid JSON")
-            continue
+        payload = info.json()
+        if not isinstance(payload, dict):
+            raise WhoLookupError(f"codeinfo for {code} returned a non-object body")
 
-        if display:
-            logger.info("resolved %s to %r via the %s path", code, display, path)
-            return display, path  # type: ignore[return-value]
-        failures.append(f"{path}: no display in response")
+        # Follow stemId, not @id: on a codeinfo response @id is the codeinfo URL itself, so
+        # following it would just loop back here.
+        stem_id = payload.get("stemId")
+        if not isinstance(stem_id, str) or not stem_id:
+            raise WhoLookupError(f"codeinfo for {code} carried no stemId")
 
-    raise WhoLookupError(f"lookup of {code} failed ({'; '.join(failures)})")
+        entity_url = local_entity_url(stem_id)
+        entity = await client.get(entity_url, headers=NATIVE_HEADERS)
+        if entity.status_code != 200:
+            raise WhoLookupError(f"entity {entity_url} returned HTTP {entity.status_code}")
+
+        body = entity.json()
+        title = _label(body.get("title")) if isinstance(body, dict) else None
+        if not title:
+            raise WhoLookupError(f"entity {entity_url} carried no title")
+    except httpx.TimeoutException as exc:
+        raise WhoLookupError(f"WHO lookup of {code} timed out") from exc
+    except httpx.RequestError as exc:
+        # Expected while the WHO container is still loading the ICD-11 release.
+        raise WhoLookupError(f"WHO lookup of {code} could not connect: {exc}") from exc
+    except ValueError as exc:
+        raise WhoLookupError(f"WHO lookup of {code} returned malformed JSON") from exc
+
+    logger.info("resolved %s to %r via native codeinfo -> %s", code, title, stem_id)
+    return title
 
 
 @app.get("/spike")
@@ -188,7 +153,7 @@ async def spike(request: Request) -> dict[str, Any]:
     concepts pulled from the WHO release.
     """
     try:
-        live_display, _ = await who_lookup(request.app.state.http, DEMO_ANCHOR_CODE)
+        live_display = await who_lookup(request.app.state.http, DEMO_ANCHOR_CODE)
     except WhoLookupError as exc:
         # 503, not 500: the usual cause is the WHO container still warming up.
         raise HTTPException(status_code=503, detail=f"WHO ICD-11 lookup unavailable -- {exc}") from exc
